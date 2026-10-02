@@ -1,0 +1,13 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 日志与本地状态
+*.log
+.plugin-manager/
+
+# 编辑器 / 系统杂物
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
