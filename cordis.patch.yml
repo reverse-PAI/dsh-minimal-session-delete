@@ -1,5 +1,3 @@
-# dsh-session-delete bundle layer: inserts the session-delete plugin row.
-# The row id stays stable so a profile patch can target or disable it.
 - insert:
     - id: dsh-session-delete
-      name: '@local/dsh-session-delete'
+      name: 'dsh-sessiondelete'

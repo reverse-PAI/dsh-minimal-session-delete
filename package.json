@@ -1,9 +1,30 @@
 {
-  "name": "@local/dsh-session-delete",
-  "version": "1.0.0",
-  "private": true,
+  "name": "dsh-sessiondelete",
+  "version": "1.0.1",
   "description": "Permanently delete a DeepSeek Harness session: a sidebar session-row \"...\" menu item plus a hover button, a risk-consent dialog, and an authenticated Host route that removes the session log, its projection-cache row and its archive mark.",
   "type": "module",
+  "license": "MIT",
+  "author": "reverse-PAI",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reverse-PAI/dsh-sessiondelete.git"
+  },
+  "homepage": "https://github.com/reverse-PAI/dsh-sessiondelete#readme",
+  "bugs": {
+    "url": "https://github.com/reverse-PAI/dsh-sessiondelete/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "session",
+    "delete"
+  ],
+  "files": [
+    "src",
+    "cordis.patch.yml"
+  ],
   "exports": {
     ".": "./src/index.js",
     "./client": "./src/client.js",
@@ -17,7 +38,8 @@
       "platform": "web",
       "immediately": true,
       "inject": [
-        "@deepseek-ai/dsh-client-ui-workspace"
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-primitives"
       ]
     }
   }
