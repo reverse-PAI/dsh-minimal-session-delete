@@ -1,5 +1,5 @@
 {
-  "name": "dsh-sessiondelete",
+  "name": "dsh-minimal-session-delete",
   "version": "1.0.1",
   "description": "Permanently delete a DeepSeek Harness session: a sidebar session-row \"...\" menu item plus a hover button, a risk-consent dialog, and an authenticated Host route that removes the session log, its projection-cache row and its archive mark.",
   "type": "module",
@@ -7,11 +7,11 @@
   "author": "reverse-PAI",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/reverse-PAI/dsh-sessiondelete.git"
+    "url": "git+https://github.com/reverse-PAI/dsh-minimal-session-delete.git"
   },
-  "homepage": "https://github.com/reverse-PAI/dsh-sessiondelete#readme",
+  "homepage": "https://github.com/reverse-PAI/dsh-minimal-session-delete#readme",
   "bugs": {
-    "url": "https://github.com/reverse-PAI/dsh-sessiondelete/issues"
+    "url": "https://github.com/reverse-PAI/dsh-minimal-session-delete/issues"
   },
   "keywords": [
     "dsh",

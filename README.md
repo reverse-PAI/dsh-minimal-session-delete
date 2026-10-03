@@ -1,11 +1,11 @@
-# 🗑️ dsh-sessiondelete
+# 🗑️ dsh-minimal-session-delete
 
 **DeepSeek Harness 的小插件：把一条会话永久删掉，干净利落。**
 
 DSH 有归档、没有删除，持久化层也明确不提供删除 API，这条链路就由插件自己走完：侧边栏入口 → 二次确认 → Host 鉴权路由 → 把会话的日志、缓存、归档/置顶标记和工作区槽位一次清干净。
 
-- 📦 包名：`dsh-sessiondelete` · 🧩 Host 半 + 浏览器半的 bundle 插件 · 🪶 依赖 0、构建 0、配置 0
-- 🔗 安装：`dsh plugin add dsh-sessiondelete`
+- 📦 包名：`dsh-minimal-session-delete` · 🧩 Host 半 + 浏览器半的 bundle 插件 · 🪶 依赖 0、构建 0、配置 0
+- 🔗 安装：`dsh plugin add dsh-minimal-session-delete`
 
 ---
 
@@ -44,7 +44,7 @@ DSH 有归档、没有删除，持久化层也明确不提供删除 API，这条
 **🥇 推荐：从 npm 安装**。打开 **设置 → 插件 → 添加插件**，在「包名或地址」中输入：
 
 ```
-dsh-sessiondelete
+dsh-minimal-session-delete
 ```
 
 装好会自动进 `dsh.profile.bundles` 并默认启用，**不需要 clone、构建或额外安装**。应用提示刷新或重新打开，按提示完成即可。
@@ -52,20 +52,20 @@ dsh-sessiondelete
 命令行等价写法（先完全退出桌面应用）：
 
 ```bash
-dsh plugin --profile desktop add dsh-sessiondelete
+dsh plugin --profile desktop add dsh-minimal-session-delete
 ```
 
 **🥈 备选：从 GitHub 或本地目录安装**。同一个输入框里填 GitHub 规格或本地绝对路径：
 
 ```
-github:reverse-PAI/dsh-sessiondelete#v1.0.1
+github:reverse-PAI/dsh-minimal-session-delete#v1.0.1
 ```
 
 末尾 `#v1.0.1` 是版本 tag，想跟主分支最新代码就省略；本地开发可以直接填 `<项目目录>`。
 
-**⌨️ 手动接 profile**：在 profile 的 `package.json` 里把 `dsh-sessiondelete` 加进 `dsh.profile.bundles`，并在 `dependencies` 里写 `"dsh-sessiondelete": "^1.0.1"`（走 npm）或 `"dsh-sessiondelete": "link:<项目目录>"`（走本地源码）。
+**⌨️ 手动接 profile**：在 profile 的 `package.json` 里把 `dsh-minimal-session-delete` 加进 `dsh.profile.bundles`，并在 `dependencies` 里写 `"dsh-minimal-session-delete": "^1.0.1"`（走 npm）或 `"dsh-minimal-session-delete": "link:<项目目录>"`（走本地源码）。
 
-**🗑️ 卸载**：`dsh plugin --profile desktop remove dsh-sessiondelete`
+**🗑️ 卸载**：`dsh plugin --profile desktop remove dsh-minimal-session-delete`
 
 **✅ 装完自检**：会话行悬停有垃圾桶按钮、`...` 菜单有「删除会话」→ 先 `dryRun` 看一眼要删什么 → 真删一条，看它原地消失、`$DSH_HOME/sessions/` 下的目录也没了。
 

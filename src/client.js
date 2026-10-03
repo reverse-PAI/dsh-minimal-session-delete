@@ -1,9 +1,9 @@
 window.__ModuleLoader__.load({
-  id: 'dsh-sessiondelete',
+  id: 'dsh-minimal-session-delete',
   factory(require) {
     const React = require('react')
     const h = React.createElement
-    const NS = 'dsh-sessiondelete'
+    const NS = 'dsh-minimal-session-delete'
     const ROUTE = 'api/dsh-session-delete'
     const SHORTCUT_ID = 'session.delete'
     const ACTION_ID = 'dsh-session-delete'
