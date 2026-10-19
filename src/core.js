@@ -5,6 +5,14 @@ const PROJECTION_DOMAIN = 'session_projcache'
 const PROJECTION_TABLE = 'sessions'
 const DELETE_PASSES = 11
 const DELETE_RETRY_MS = 200
+const QUIESCE_TIMEOUT_MS = 15_000
+const QUIESCE_POLL_MS = 50
+// The only file the host parses when it lists a session. Renaming it away makes
+// the session vanish from persistence listings without touching the directory
+// name (the host rejects a log whose header id no longer matches its path).
+const GENERATION_FILE = /^session\.v\d+\.jsonl(?:\.zstd)?$/
+const STAGE_MARK = '.deleting-'
+const STAGE_SWEEP_MIN_AGE_MS = 10 * 60 * 1000
 // Host ids are `session-<uuid>` (or a bare uuid); third-party bridges invent their own
 // prefixes (e.g. dsh-social-bridge-plugin uses `social-<hex32>`). Accept any single path
 // segment made of safe characters instead of whitelisting host formats.
@@ -14,6 +22,7 @@ const delay = ms => new Promise((resolve) => { setTimeout(resolve, ms) })
 const fail = (status, code, message, extra) => ({ status, body: { ok: false, code, message, ...extra } })
 const pass = body => ({ status: 200, body: { ok: true, ...body } })
 const note = (warnings, label, error) => { warnings.push(`${label}: ${messageOf(error)}`) }
+const isMissing = error => error?.code === 'ENOENT' || error?.code === 'ENOTDIR'
 function service(ctx, key) {
   try {
     return typeof ctx.get === 'function' ? ctx.get(key) : undefined
@@ -111,17 +120,19 @@ function cacheRowExists(cache, variant) {
   }
   return fs.existsSync(cacheRecordPath(variant))
 }
-async function locate(ctx, sessionId, variants, root, warnings) {
+async function locate(ctx, variants, root, warnings) {
   const live = variants
     .map(variant => ({ variant, session: ctx.sessions.get(variant) }))
     .filter(entry => entry.session !== undefined)
   const persistence = service(ctx, 'sessionPersistence')
   let persisted = false
+  let persistedVariant
   if (persistence !== undefined && typeof persistence.stat === 'function') {
     for (const variant of variants) {
       try {
         if ((await persistence.stat(variant)) !== undefined) {
           persisted = true
+          persistedVariant = variant
           break
         }
       } catch (error) {
@@ -130,51 +141,86 @@ async function locate(ctx, sessionId, variants, root, warnings) {
     }
   }
   const cache = cacheTable(ctx)
-  const cachedRows = variants.filter(variant => cacheRowExists(cache, variant)).length
-  return { live, persisted, cachedRows, cache, dirs: findSessionDirs(sessionId, root) }
+  const cached = variants.filter(variant => cacheRowExists(cache, variant))
+  const dirs = []
+  for (const variant of new Set(variants)) dirs.push(...findSessionDirs(variant, root))
+  const uniqueDirs = [...new Set(dirs)]
+  // Report the id the host/UI actually uses, not just the spelling the caller typed
+  // (the API accepts both `session-<uuid>` and the bare uuid).
+  let canonical = variants[0]
+  if (live.length > 0) canonical = live[0].variant
+  else if (uniqueDirs.length > 0) canonical = path.basename(uniqueDirs[0])
+  else if (persistedVariant !== undefined) canonical = persistedVariant
+  else if (cached.length > 0) canonical = cached[0]
+  return { live, persisted, cachedRows: cached.length, cache, dirs: uniqueDirs, canonical }
 }
-function runningRefusal(ctx, variants, sessionId) {
-  for (const variant of variants) {
-    const agent = ctx.agents.get(variant)
-    if (agent !== undefined && agent.status === 'running') {
-      return fail(409, 'running', `session "${variant}" is running; stop it before deleting`, { sessionId })
+function agentPhase(agent) {
+  const kind = agent?.phase?.kind
+  if (typeof kind === 'string') return kind
+  return agent?.status === 'running' ? 'running' : 'idle'
+}
+export async function waitForAgentIdle(agent, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : QUIESCE_TIMEOUT_MS
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : QUIESCE_POLL_MS
+  const deadline = Date.now() + timeoutMs
+  while (agentPhase(agent) !== 'idle') {
+    if (Date.now() >= deadline) return false
+    await delay(pollMs)
+  }
+  return true
+}
+function runningRefusal(ctx, described) {
+  for (const entry of described) {
+    for (const variant of entry.variants) {
+      const agent = ctx.agents.get(variant)
+      if (agent !== undefined && agent.status === 'running') {
+        return fail(409, 'running', `session "${variant}" is running; stop it before deleting`, { sessionId: entry.sessionId })
+      }
     }
   }
   return undefined
 }
-async function quiesce(ctx, live, warnings) {
-  for (const { variant, session } of live) {
-    const agent = ctx.agents.get(variant)
-    if (agent !== undefined && typeof agent.cancel === 'function') {
+async function quiesce(ctx, described, warnings, options = {}) {
+  for (const entry of described) {
+    for (const { variant, session } of entry.live) {
+      const agent = ctx.agents.get(variant)
+      if (agent !== undefined && agentPhase(agent) !== 'idle') {
+        try {
+          if (typeof agent.cancel === 'function') agent.cancel({ kind: 'user' })
+        } catch (error) {
+          note(warnings, `cancel("${variant}")`, error)
+        }
+        const stopped = await waitForAgentIdle(agent, {
+          timeoutMs: options.quiesceTimeoutMs,
+          pollMs: options.quiescePollMs,
+        })
+        if (!stopped) {
+          return {
+            refusal: fail(
+              409,
+              'still-running',
+              `session "${variant}" is still stopping; wait for the turn to finish and retry`,
+              { sessionId: entry.sessionId },
+            ),
+          }
+        }
+      }
       try {
-        agent.cancel({ kind: 'user' })
+        await ctx.sessions.flush(session)
       } catch (error) {
-        note(warnings, `cancel("${variant}")`, error)
+        note(warnings, `flush("${variant}")`, error)
       }
     }
-    try {
-      await ctx.sessions.flush(session)
-    } catch (error) {
-      note(warnings, `flush("${variant}")`, error)
-    }
   }
+  return {}
 }
-function detachLive(ctx, variants, live, sessionId, warnings) {
+function detachEntries(ctx, variants, warnings) {
   const store = ctx.sessions.store
   const canDetach = typeof ctx.sessions.detachEntered === 'function'
     && store !== undefined && typeof store.get === 'function'
-  if (live.length > 0 && !canDetach) {
-    return {
-      refusal: fail(
-        409,
-        'cannot-detach',
-        'this Harness build does not expose the session-store detach path needed to delete an attached session',
-        { sessionId },
-      ),
-    }
-  }
-  if (!canDetach) return { detached: false }
-  let detached = false
+  if (!canDetach) return { canDetach, detached: new Set(), failed: [] }
+  const detached = new Set()
+  const failed = []
   for (const variant of variants) {
     let entry
     try {
@@ -185,34 +231,233 @@ function detachLive(ctx, variants, live, sessionId, warnings) {
     if (entry === undefined) continue
     try {
       ctx.sessions.detachEntered(entry)
-      detached = true
+      detached.add(variant)
     } catch (error) {
+      failed.push({ variant, reason: messageOf(error) })
       note(warnings, `detach("${variant}")`, error)
     }
   }
-  return { detached }
+  return { canDetach, detached, failed }
 }
-async function removeAll(sessionId, root, warnings, targets) {
-  const removed = []
-  const failed = new Map()
-  let remaining = targets
-  for (let passIndex = 0; ; passIndex += 1) {
-    const outcome = removeSessionDirs(remaining)
-    removed.push(...outcome.removed)
-    for (const entry of outcome.failed) failed.set(entry.dir, entry.reason)
-    remaining = findSessionDirs(sessionId, root)
-    if (remaining.length === 0 || passIndex >= DELETE_PASSES - 1) break
-    await delay(DELETE_RETRY_MS)
+/**
+ * Drop the agent registry entries of the sessions being deleted. The host disposes
+ * sessions but never agents on `session/disposed`, so without this step every
+ * deleted live session leaves an agent behind in `ctx.agents` (memory plus a
+ * stale `agent/status` source). `detachEntered` is idempotent: a later loop
+ * teardown sees the entry gone and does nothing.
+ */
+function detachAgents(ctx, variants, warnings) {
+  const agents = ctx.agents
+  if (agents === undefined || typeof agents.detachEntered !== 'function') return 0
+  const store = agents.store
+  if (store === undefined || typeof store.get !== 'function') return 0
+  let detached = 0
+  for (const variant of variants) {
+    let entry
+    try {
+      entry = store.get(variant)
+    } catch {
+      entry = undefined
+    }
+    if (entry === undefined) continue
+    try {
+      agents.detachEntered(entry)
+      detached += 1
+    } catch (error) {
+      note(warnings, `agent detach("${variant}")`, error)
+    }
   }
-  for (const [dir, reason] of failed) note(warnings, `rm("${dir}") failed`, new Error(reason))
-  return { removed, remaining }
+  return detached
+}
+export function stageSessionDirs(dirs) {
+  const stamp = `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2, 10)}`
+  const staged = []
+  const failed = []
+  for (const dir of dirs) {
+    let entries
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch (error) {
+      if (isMissing(error)) continue
+      failed.push({ dir, reason: messageOf(error) })
+      continue
+    }
+    // Hide the generation log instead of renaming the directory: the host lists
+    // every directory under a project and rejects a log whose header does not
+    // match its path, so a renamed directory would break persistence listing.
+    // A directory without a parseable generation log is simply skipped.
+    const moves = []
+    let failure
+    for (const entry of entries) {
+      if (!entry.isFile() || !GENERATION_FILE.test(entry.name)) continue
+      const from = path.join(dir, entry.name)
+      const to = path.join(dir, `${STAGE_MARK}${stamp}--${entry.name}`)
+      try {
+        fs.renameSync(from, to)
+        moves.push({ from, to })
+      } catch (error) {
+        failure = error
+        break
+      }
+    }
+    if (failure !== undefined) {
+      for (const move of [...moves].reverse()) {
+        try {
+          fs.renameSync(move.to, move.from)
+        } catch {
+          // reported by the caller through `failed`
+        }
+      }
+      failed.push({ dir, reason: messageOf(failure) })
+      continue
+    }
+    staged.push({ dir, moves })
+  }
+  return { staged, failed }
+}
+export function rollbackStagedDirs(staged, warnings) {
+  const failed = []
+  for (const { dir, moves } of [...staged].reverse()) {
+    for (const { from, to } of [...moves].reverse()) {
+      try {
+        fs.renameSync(to, from)
+      } catch (error) {
+        failed.push({ from, to, reason: messageOf(error) })
+        note(warnings, `rollback("${to}" -> "${from}")`, error)
+      }
+    }
+  }
+  return failed
+}
+async function removeStaged(staged, warnings) {
+  const targets = staged.map(entry => entry.dir)
+  const noted = new Set()
+  for (let pass = 0; pass < DELETE_PASSES; pass += 1) {
+    if (pass > 0) await delay(DELETE_RETRY_MS)
+    const outcome = removeSessionDirs(targets.filter(dir => fs.existsSync(dir)))
+    for (const { dir, reason } of outcome.failed) {
+      if (noted.has(dir)) continue
+      noted.add(dir)
+      note(warnings, `rm("${dir}") failed`, new Error(reason))
+    }
+    if (targets.every(dir => !fs.existsSync(dir))) break
+  }
+  return targets.filter(dir => fs.existsSync(dir))
+}
+function sweepStaleStaged(root, warnings) {
+  let slugs
+  try {
+    slugs = fs.readdirSync(root, { withFileTypes: true })
+  } catch {
+    return
+  }
+  const cutoff = Date.now() - STAGE_SWEEP_MIN_AGE_MS
+  const stagedName = new RegExp(`^${STAGE_MARK.replaceAll('.', '\\.')}(\\d+)-(\\d+)-[0-9a-f]+--`)
+  for (const slug of slugs) {
+    if (!slug.isDirectory()) continue
+    const slugPath = path.join(root, slug.name)
+    let dirs
+    try {
+      dirs = fs.readdirSync(slugPath, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const dir of dirs) {
+      if (!dir.isDirectory()) continue
+      const full = path.join(slugPath, dir.name)
+      let files
+      try {
+        files = fs.readdirSync(full, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      let stale = false
+      let live = false
+      for (const file of files) {
+        if (!file.isFile()) continue
+        if (GENERATION_FILE.test(file.name)) {
+          live = true
+          break
+        }
+        const match = stagedName.exec(file.name)
+        if (match !== null && Number(match[1]) <= cutoff) stale = true
+      }
+      if (live || !stale) continue
+      try {
+        fs.rmSync(full, { recursive: true, force: true })
+        warnings.push(`swept stale staged session "${full}"`)
+      } catch (error) {
+        note(warnings, `sweep("${full}")`, error)
+      }
+    }
+  }
+}
+/**
+ * Collect subagent-origin descendants of `sessionId` from both the live session
+ * store and the persistence listing (so cold subagent logs are covered too).
+ * Fork lineage shares `header.parentSession` but not `origin === 'subagent'`;
+ * forks are independent user sessions and are intentionally left alone.
+ */
+export async function discoverSubagentDescendants(ctx, sessionId, warnings) {
+  const parentOf = new Map()
+  const subagentOf = new Set()
+  const add = header => {
+    if (header === null || typeof header !== 'object' || typeof header.id !== 'string') return
+    if (typeof header.parentSession === 'string' && header.parentSession.length > 0) parentOf.set(header.id, header.parentSession)
+    if (header.origin === 'subagent') subagentOf.add(header.id)
+  }
+  try {
+    const live = typeof ctx.sessions.list === 'function' ? ctx.sessions.list() : []
+    for (const session of live) add(session?.header)
+  } catch (error) {
+    note(warnings, 'live session list', error)
+  }
+  const persistence = service(ctx, 'sessionPersistence')
+  if (persistence !== undefined && typeof persistence.list === 'function') {
+    try {
+      for (const snapshot of await persistence.list()) add(snapshot?.header)
+    } catch (error) {
+      note(warnings, 'stored session list', error)
+    }
+  }
+  const children = new Map()
+  for (const [id, parent] of parentOf) {
+    if (id === parent || !subagentOf.has(id)) continue
+    const siblings = children.get(parent)
+    if (siblings === undefined) children.set(parent, [id])
+    else siblings.push(id)
+  }
+  const found = []
+  const emitted = new Set()
+  const seeds = sessionIdVariants(sessionId)
+  const seen = new Set(seeds)
+  const queue = [...seeds]
+  while (queue.length > 0) {
+    const parent = queue.shift()
+    for (const child of children.get(parent) ?? []) {
+      if (!emitted.has(child)) {
+        emitted.add(child)
+        found.push(child)
+      }
+      for (const variant of sessionIdVariants(child)) {
+        if (seen.has(variant)) continue
+        seen.add(variant)
+        queue.push(variant)
+      }
+    }
+  }
+  return found
 }
 async function dropCacheRow(cache, variant, warnings) {
   if (cache !== undefined) {
     try {
       return await cache.delete(variant)
     } catch (error) {
+      // The domain row is still in memory. Deleting the on-disk copy here would
+      // let the in-memory snapshot resurrect the row on the next write/close, so
+      // leave the storage alone and surface the failure instead.
       note(warnings, `projection cache delete("${variant}")`, error)
+      return false
     }
   }
   const file = cacheRecordPath(variant)
@@ -285,26 +530,39 @@ export async function deleteSessionCore(ctx, rawSessionId, options = {}) {
     return fail(400, 'invalid-id', `invalid session id: ${JSON.stringify(rawSessionId)}`)
   }
   const warnings = []
-  const variants = sessionIdVariants(sessionId)
   const root = sessionsRoot(ctx)
-  const { live, persisted, cachedRows, cache, dirs } = await locate(ctx, sessionId, variants, root, warnings)
-  if (dirs.length === 0 && live.length === 0 && !persisted && cachedRows === 0) {
+  const primaryVariants = sessionIdVariants(sessionId)
+  const primary = await locate(ctx, primaryVariants, root, warnings)
+  if (primary.dirs.length === 0 && primary.live.length === 0 && !primary.persisted && primary.cachedRows === 0) {
     return fail(404, 'not-found', `no session found for "${sessionId}"`)
   }
-  const refusal = runningRefusal(ctx, variants, sessionId)
-  if (refusal !== undefined) return refusal
+  const descendants = await discoverSubagentDescendants(ctx, sessionId, warnings)
+  const described = [{ sessionId, variants: primaryVariants, ...primary }]
+  for (const childId of descendants) {
+    const variants = sessionIdVariants(childId)
+    const located = await locate(ctx, variants, root, warnings)
+    if (located.dirs.length === 0 && located.live.length === 0 && !located.persisted && located.cachedRows === 0) continue
+    described.push({ sessionId: childId, variants, ...located })
+  }
   if (options.dryRun === true) {
     return pass({
       dryRun: true,
       sessionId,
       root,
-      dirs: relativeDirs(dirs, root),
-      attached: live.length > 0,
-      persisted,
-      cachedRows,
+      dirs: relativeDirs(primary.dirs, root),
+      attached: primary.live.length > 0,
+      persisted: primary.persisted,
+      cachedRows: primary.cachedRows,
+      sessions: described.map(entry => ({
+        sessionId: entry.sessionId,
+        dirs: relativeDirs(entry.dirs, root),
+        attached: entry.live.length > 0,
+        persisted: entry.persisted,
+        cachedRows: entry.cachedRows,
+      })),
     })
   }
-  if (persisted && dirs.length === 0) {
+  if (primary.persisted && primary.dirs.length === 0) {
     return fail(
       409,
       'logs-not-found',
@@ -312,39 +570,77 @@ export async function deleteSessionCore(ctx, rawSessionId, options = {}) {
       { sessionId, root },
     )
   }
-  await quiesce(ctx, live, warnings)
-  const detach = detachLive(ctx, variants, live, sessionId, warnings)
-  if (detach.refusal !== undefined) return detach.refusal
-  const { removed, remaining } = await removeAll(sessionId, root, warnings, dirs)
-  if (remaining.length > 0) {
-    const remainingRel = relativeDirs(remaining, root)
-    for (const dir of remaining) ctx.logger?.warn?.(`dsh-session-delete: could not remove ${dir}`)
-    const detachedNote = detach.detached
-      ? ' the session was already detached from the running app, so retry with this sessionId once the files are released'
-      : ''
+  const viable = [described[0]]
+  for (const entry of described.slice(1)) {
+    if (entry.persisted && entry.dirs.length === 0) {
+      warnings.push(`skipped subagent session "${entry.sessionId}": persistence reports it but no log directory exists`)
+      continue
+    }
+    viable.push(entry)
+  }
+  const refusal = runningRefusal(ctx, viable)
+  if (refusal !== undefined) return refusal
+  const quiet = await quiesce(ctx, viable, warnings, options)
+  if (quiet.refusal !== undefined) return quiet.refusal
+  const allVariants = viable.flatMap(entry => entry.variants)
+  const hasLive = viable.some(entry => entry.live.length > 0)
+  const probe = detachEntries(ctx, [], warnings)
+  if (hasLive && !probe.canDetach) {
+    return fail(
+      409,
+      'cannot-detach',
+      'this Harness build does not expose the session-store detach path needed to delete an attached session',
+      { sessionId, root },
+    )
+  }
+  sweepStaleStaged(root, warnings)
+  // Rename first: the visible session path disappears before any live session is
+  // detached, and a failed rename leaves the app and the files fully intact.
+  const allDirs = [...new Set(viable.flatMap(entry => entry.dirs))]
+  const { staged, failed } = stageSessionDirs(allDirs)
+  if (failed.length > 0) {
+    rollbackStagedDirs(staged, warnings)
     return fail(
       500,
       'delete-failed',
-      `session files could not be fully removed: ${remainingRel.join(', ')};` +
-        ` archive marks, pins, projection cache and workspace slots were left untouched.${detachedNote}`,
+      `session files could not be staged for removal: ${failed.map(entry => entry.reason).join('; ')}`,
+      { sessionId, root, warnings },
+    )
+  }
+  const detach = detachEntries(ctx, allVariants, warnings)
+  if (detach.failed.length > 0) {
+    rollbackStagedDirs(staged, warnings)
+    return fail(
+      500,
+      'detach-failed',
+      `session "${detach.failed[0].variant}" could not be detached; the files were restored${detach.detached.size > 0 ? ' (a partially detached session may need a reload)' : ''}`,
       {
         sessionId,
         root,
-        removedDirs: relativeDirs(removed, root),
-        remainingDirs: remainingRel,
+        detached: [...detach.detached],
         warnings,
       },
     )
   }
+  const removedDirs = staged.map(entry => entry.dir)
+  const agentsDetached = detachAgents(ctx, allVariants, warnings)
+  const remaining = await removeStaged(staged, warnings)
   const registry = service(ctx, 'workspaceRegistry')
-  const { cacheRowsCleared, archiveCleared, pinCleared } = await clearAccounting(registry, variants, cache, warnings)
-  await detachWorkspaceSlots(registry, variants, warnings)
+  const { cacheRowsCleared, archiveCleared, pinCleared } = await clearAccounting(registry, allVariants, primary.cache, warnings)
+  await detachWorkspaceSlots(registry, allVariants, warnings)
+  const detachedIds = [...detach.detached]
+  const removedSessions = viable.map(entry => entry.canonical ?? entry.sessionId)
+  const broadcast = removedSessions.filter(id => !sessionIdVariants(id).some(variant => detach.detached.has(variant)))
   return pass({
     sessionId,
     root,
-    removedDirs: relativeDirs(removed, root),
-    remainingDirs: [],
-    detached: detach.detached,
+    removedDirs: relativeDirs(removedDirs, root),
+    remainingDirs: relativeDirs(remaining, root),
+    removedSessions,
+    broadcast,
+    detached: detach.detached.size > 0,
+    detachedSessions: detachedIds,
+    agentsDetached,
     cacheRowsCleared,
     archiveCleared,
     pinCleared,

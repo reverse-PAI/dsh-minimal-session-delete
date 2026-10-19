@@ -2,6 +2,7 @@ import { deleteSessionCore } from './core.js'
 export const name = 'dsh-session-delete'
 export const inject = ['sessions', 'agents', 'connection']
 export const DELETE_ROUTE = '/api/dsh-session-delete'
+const messageOf = error => (error instanceof Error ? error.message : String(error))
 function json(status, body) {
   return new Response(JSON.stringify(body), {
     status,
@@ -34,18 +35,23 @@ export function apply(ctx) {
       try {
         result = await deleteSessionCore(ctx, payload['sessionId'], { dryRun: payload['dryRun'] === true })
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        ctx.logger?.error?.(`dsh-session-delete: delete failed: ${message}`)
-        result = { status: 500, body: { ok: false, code: 'internal', message } }
+        ctx.logger?.error?.(`dsh-session-delete: delete failed: ${messageOf(error)}`)
+        result = {
+          status: 500,
+          body: { ok: false, code: 'internal', message: 'internal error while deleting the session' },
+        }
       }
-      if (result.status === 200 && result.body?.dryRun !== true && result.body?.detached !== true) {
+      if (result.status === 200 && result.body?.dryRun !== true) {
         // A detached Session already announced itself through `session/disposed`; a
         // session that was cold (only on disk) has no such event, so the sidebar row
         // would survive until a page reload without this broadcast.
-        try {
-          ctx.emit('api-session/removed', result.body.sessionId)
-        } catch (error) {
-          ctx.logger?.warn?.(`dsh-session-delete: removal broadcast failed: ${error instanceof Error ? error.message : String(error)}`)
+        const broadcast = Array.isArray(result.body?.broadcast) ? result.body.broadcast : []
+        for (const sessionId of broadcast) {
+          try {
+            ctx.emit('api-session/removed', sessionId)
+          } catch (error) {
+            ctx.logger?.warn?.(`dsh-session-delete: removal broadcast failed: ${messageOf(error)}`)
+          }
         }
       }
       return json(result.status, result.body)

@@ -22,6 +22,7 @@ window.__ModuleLoader__.load({
       'dialog.description': '确定要永久删除「{title}」吗？',
       'dialog.warning': '会话日志、投影缓存与归档记录都会被删除。',
       'dialog.warningUndo': '此操作无法恢复。',
+      'dialog.childrenHint': '该会话派生的子代理会话会一并删除；用户主动分叉（fork）的会话不受影响。',
       'dialog.runningHint': '该会话正在运行，请先停止它再删除。',
       'dialog.pending': '删除中…',
       'shortcut.noSession': '没有正在打开的会话',
@@ -29,6 +30,7 @@ window.__ModuleLoader__.load({
       'common.delete': '永久删除',
       'common.close': '关闭',
       'errors.requestFailed': '删除请求失败',
+      'errors.forbidden': '当前连接没有删除会话的权限',
     }
     const EN = {
       'menu.deleteSession': 'Delete session',
@@ -36,6 +38,7 @@ window.__ModuleLoader__.load({
       'dialog.description': 'Permanently delete "{title}"?',
       'dialog.warning': 'The session log, its projection cache and its archive mark are all removed.',
       'dialog.warningUndo': 'This cannot be undone.',
+      'dialog.childrenHint': 'Subagent sessions derived from this session are deleted too; sessions you forked yourself are kept.',
       'dialog.runningHint': 'This session is running. Stop it before deleting.',
       'dialog.pending': 'Deleting…',
       'shortcut.noSession': 'No session is open',
@@ -43,6 +46,7 @@ window.__ModuleLoader__.load({
       'common.delete': 'Delete permanently',
       'common.close': 'Close',
       'errors.requestFailed': 'Delete request failed',
+      'errors.forbidden': 'This connection is not allowed to delete sessions',
     }
     const MENU_CSS = `
 .dsd-itemWrap{position:relative}
@@ -83,6 +87,7 @@ window.__ModuleLoader__.load({
 .dsd-id{color:var(--dsw-alias-label-primary);margin:0 0 8px;font-family:var(--dsw-font-mono,monospace);font-size:13px;line-height:20px;word-break:break-all}
 .dsd-warn{margin:0;color:var(--dsw-alias-state-error-primary);font-size:13px;line-height:20px;word-break:keep-all;overflow-wrap:break-word}
 .dsd-warn + .dsd-warn{margin-top:2px}
+.dsd-hint{margin:8px 0 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;word-break:keep-all;overflow-wrap:break-word}
 .dsd-status{margin-top:8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
 .dsd-error{margin-top:8px;color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}
 .dsd-footer{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:0 24px}
@@ -298,6 +303,7 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'dsd-id' }, request.sessionId),
                 h('p', { className: 'dsd-warn' }, t('dialog.warning')),
                 h('p', { className: 'dsd-warn' }, t('dialog.warningUndo')),
+                h('p', { className: 'dsd-hint' }, t('dialog.childrenHint')),
                 running ? h('p', { className: 'dsd-warn' }, t('dialog.runningHint')) : null,
                 busy ? h('div', { className: 'dsd-status', role: 'status' }, t('dialog.pending')) : null,
                 error === null ? null : h('div', { className: 'dsd-error', role: 'alert' }, error),
@@ -384,10 +390,16 @@ window.__ModuleLoader__.load({
           const payload = await response.json().catch(() => null)
           if (response.ok && payload?.ok === true) {
             // The deleted session may be the one the main view is showing; leaving it
-            // mounted leaves a "history load failed" panel behind.
-            if (wasOpen) clearMainView()
+            // mounted leaves a "history load failed" panel behind. Re-check right
+            // before clearing: another window may have opened a different session in
+            // the meantime, and a detached session already clears this in the host.
+            if (wasOpen && retainedInMainView(sessionId)) clearMainView()
+            if (Array.isArray(payload.remainingDirs) && payload.remainingDirs.length > 0) {
+              console.warn('dsh-session-delete: session is logically deleted but files remain:', payload.remainingDirs)
+            }
             return payload
           }
+          if (response.status === 403) throw failure(`: ${t('errors.forbidden')}`)
           const detail = typeof payload?.message === 'string' ? `: ${payload.message}` : ''
           throw failure(` (HTTP ${String(response.status)})${detail}`)
         }
