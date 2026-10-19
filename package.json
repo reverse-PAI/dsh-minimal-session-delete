@@ -1,8 +1,11 @@
 {
   "name": "dsh-minimal-session-delete",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Permanently delete a DeepSeek Harness session: a sidebar session-row \"...\" menu item plus a hover button, a risk-consent dialog, and an authenticated Host route that removes the session log, its projection-cache row and its archive mark.",
   "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "license": "MIT",
   "author": "reverse-PAI",
   "repository": {

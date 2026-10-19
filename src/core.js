@@ -5,8 +5,10 @@ const PROJECTION_DOMAIN = 'session_projcache'
 const PROJECTION_TABLE = 'sessions'
 const DELETE_PASSES = 11
 const DELETE_RETRY_MS = 200
-const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-const SESSION_ID_RE = new RegExp(`^(?:session-(?:${UUID}|\\d{1,9})|${UUID})$`, 'i')
+// Host ids are `session-<uuid>` (or a bare uuid); third-party bridges invent their own
+// prefixes (e.g. dsh-social-bridge-plugin uses `social-<hex32>`). Accept any single path
+// segment made of safe characters instead of whitelisting host formats.
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/
 const messageOf = error => (error instanceof Error ? error.message : String(error))
 const delay = ms => new Promise((resolve) => { setTimeout(resolve, ms) })
 const fail = (status, code, message, extra) => ({ status, body: { ok: false, code, message, ...extra } })
@@ -23,8 +25,15 @@ function dshHome() {
   const home = process.env['DSH_HOME']
   return home !== undefined && home.length > 0 ? home : path.join(os.homedir(), '.dsh')
 }
-export function sessionsRoot() {
+export function sessionsRoot(ctx) {
+  const persistence = ctx === undefined ? undefined : service(ctx, 'sessionPersistence')
+  const configured = persistence === undefined ? undefined : persistence.root
+  if (typeof configured === 'string' && configured.length > 0) return configured
   return path.join(dshHome(), 'sessions')
+}
+export function isValidSessionId(sessionId) {
+  // Windows silently drops a trailing dot, so `foo.` and `foo` would hit the same directory.
+  return typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId) && !sessionId.endsWith('.')
 }
 export function sessionIdVariants(sessionId) {
   const variants = new Set([sessionId])
@@ -66,8 +75,18 @@ export function removeSessionDirs(targets) {
   }
   return { removed, failed }
 }
-function relativeDirs(dirs, root) {
+export function relativeDirs(dirs, root) {
   return dirs.map(dir => path.relative(root, dir) || path.basename(dir))
+}
+export function registryIds(registry, key, warnings) {
+  if (registry === undefined) return undefined
+  try {
+    const value = registry[key]
+    return Array.isArray(value) ? value : undefined
+  } catch (error) {
+    note(warnings, `workspace.${key}`, error)
+    return undefined
+  }
 }
 function cacheTable(ctx) {
   const storageDomain = service(ctx, 'storageDomain')
@@ -92,7 +111,7 @@ function cacheRowExists(cache, variant) {
   }
   return fs.existsSync(cacheRecordPath(variant))
 }
-async function locate(ctx, sessionId, variants, warnings) {
+async function locate(ctx, sessionId, variants, root, warnings) {
   const live = variants
     .map(variant => ({ variant, session: ctx.sessions.get(variant) }))
     .filter(entry => entry.session !== undefined)
@@ -112,7 +131,7 @@ async function locate(ctx, sessionId, variants, warnings) {
   }
   const cache = cacheTable(ctx)
   const cachedRows = variants.filter(variant => cacheRowExists(cache, variant)).length
-  return { live, persisted, cachedRows, cache, dirs: findSessionDirs(sessionId) }
+  return { live, persisted, cachedRows, cache, dirs: findSessionDirs(sessionId, root) }
 }
 function runningRefusal(ctx, variants, sessionId) {
   for (const variant of variants) {
@@ -173,7 +192,7 @@ function detachLive(ctx, variants, live, sessionId, warnings) {
   }
   return { detached }
 }
-async function removeAll(sessionId, warnings, targets) {
+async function removeAll(sessionId, root, warnings, targets) {
   const removed = []
   const failed = new Map()
   let remaining = targets
@@ -181,7 +200,7 @@ async function removeAll(sessionId, warnings, targets) {
     const outcome = removeSessionDirs(remaining)
     removed.push(...outcome.removed)
     for (const entry of outcome.failed) failed.set(entry.dir, entry.reason)
-    remaining = findSessionDirs(sessionId)
+    remaining = findSessionDirs(sessionId, root)
     if (remaining.length === 0 || passIndex >= DELETE_PASSES - 1) break
     await delay(DELETE_RETRY_MS)
   }
@@ -212,9 +231,10 @@ async function clearAccounting(registry, variants, cache, warnings) {
     if (await dropCacheRow(cache, variant, warnings)) cacheRowsCleared += 1
   }
   let archiveCleared = false
-  if (registry !== undefined && Array.isArray(registry.archivedSessionIds)) {
+  const archived = registryIds(registry, 'archivedSessionIds', warnings)
+  if (archived !== undefined) {
     for (const variant of variants) {
-      if (!registry.archivedSessionIds.includes(variant)) continue
+      if (!archived.includes(variant)) continue
       try {
         await registry.unarchiveSession(variant)
         archiveCleared = true
@@ -224,9 +244,10 @@ async function clearAccounting(registry, variants, cache, warnings) {
     }
   }
   let pinCleared = false
-  if (registry !== undefined && Array.isArray(registry.pinnedSessionIds)) {
+  const pinned = registryIds(registry, 'pinnedSessionIds', warnings)
+  if (pinned !== undefined) {
     for (const variant of variants) {
-      if (!registry.pinnedSessionIds.includes(variant)) continue
+      if (!pinned.includes(variant)) continue
       try {
         await registry.unpinSession(variant)
         pinCleared = true
@@ -239,7 +260,14 @@ async function clearAccounting(registry, variants, cache, warnings) {
 }
 async function detachWorkspaceSlots(registry, variants, warnings) {
   if (registry === undefined || typeof registry.list !== 'function') return
-  for (const workspace of registry.list()) {
+  let workspaces
+  try {
+    workspaces = registry.list()
+  } catch (error) {
+    note(warnings, 'workspace list', error)
+    return
+  }
+  for (const workspace of workspaces) {
     if (workspace === null || workspace === undefined) continue
     if (typeof workspace.detachSession !== 'function') continue
     for (const variant of variants) {
@@ -253,13 +281,13 @@ async function detachWorkspaceSlots(registry, variants, warnings) {
 }
 export async function deleteSessionCore(ctx, rawSessionId, options = {}) {
   const sessionId = typeof rawSessionId === 'string' ? rawSessionId.trim() : ''
-  if (!SESSION_ID_RE.test(sessionId)) {
+  if (!isValidSessionId(sessionId)) {
     return fail(400, 'invalid-id', `invalid session id: ${JSON.stringify(rawSessionId)}`)
   }
   const warnings = []
   const variants = sessionIdVariants(sessionId)
-  const root = sessionsRoot()
-  const { live, persisted, cachedRows, cache, dirs } = await locate(ctx, sessionId, variants, warnings)
+  const root = sessionsRoot(ctx)
+  const { live, persisted, cachedRows, cache, dirs } = await locate(ctx, sessionId, variants, root, warnings)
   if (dirs.length === 0 && live.length === 0 && !persisted && cachedRows === 0) {
     return fail(404, 'not-found', `no session found for "${sessionId}"`)
   }
@@ -269,30 +297,51 @@ export async function deleteSessionCore(ctx, rawSessionId, options = {}) {
     return pass({
       dryRun: true,
       sessionId,
+      root,
       dirs: relativeDirs(dirs, root),
       attached: live.length > 0,
       persisted,
       cachedRows,
     })
   }
+  if (persisted && dirs.length === 0) {
+    return fail(
+      409,
+      'logs-not-found',
+      `persistence reports "${sessionId}" but no log directory exists under ${root}; check the configured session root`,
+      { sessionId, root },
+    )
+  }
   await quiesce(ctx, live, warnings)
   const detach = detachLive(ctx, variants, live, sessionId, warnings)
   if (detach.refusal !== undefined) return detach.refusal
-  const { removed, remaining } = await removeAll(sessionId, warnings, dirs)
-  const registry = service(ctx, 'workspaceRegistry')
-  const { cacheRowsCleared, archiveCleared, pinCleared } = await clearAccounting(registry, variants, cache, warnings)
+  const { removed, remaining } = await removeAll(sessionId, root, warnings, dirs)
   if (remaining.length > 0) {
     const remainingRel = relativeDirs(remaining, root)
     for (const dir of remaining) ctx.logger?.warn?.(`dsh-session-delete: could not remove ${dir}`)
-    return fail(500, 'delete-failed', `session files could not be fully removed: ${remainingRel.join(', ')}`, {
-      sessionId,
-      remainingDirs: remainingRel,
-      warnings,
-    })
+    const detachedNote = detach.detached
+      ? ' the session was already detached from the running app, so retry with this sessionId once the files are released'
+      : ''
+    return fail(
+      500,
+      'delete-failed',
+      `session files could not be fully removed: ${remainingRel.join(', ')};` +
+        ` archive marks, pins, projection cache and workspace slots were left untouched.${detachedNote}`,
+      {
+        sessionId,
+        root,
+        removedDirs: relativeDirs(removed, root),
+        remainingDirs: remainingRel,
+        warnings,
+      },
+    )
   }
+  const registry = service(ctx, 'workspaceRegistry')
+  const { cacheRowsCleared, archiveCleared, pinCleared } = await clearAccounting(registry, variants, cache, warnings)
   await detachWorkspaceSlots(registry, variants, warnings)
   return pass({
     sessionId,
+    root,
     removedDirs: relativeDirs(removed, root),
     remainingDirs: [],
     detached: detach.detached,

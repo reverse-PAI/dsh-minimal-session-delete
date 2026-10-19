@@ -38,6 +38,16 @@ export function apply(ctx) {
         ctx.logger?.error?.(`dsh-session-delete: delete failed: ${message}`)
         result = { status: 500, body: { ok: false, code: 'internal', message } }
       }
+      if (result.status === 200 && result.body?.dryRun !== true && result.body?.detached !== true) {
+        // A detached Session already announced itself through `session/disposed`; a
+        // session that was cold (only on disk) has no such event, so the sidebar row
+        // would survive until a page reload without this broadcast.
+        try {
+          ctx.emit('api-session/removed', result.body.sessionId)
+        } catch (error) {
+          ctx.logger?.warn?.(`dsh-session-delete: removal broadcast failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
       return json(result.status, result.body)
     },
   })

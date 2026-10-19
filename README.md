@@ -33,7 +33,7 @@ DSH 有归档、没有删除，持久化层也明确不提供删除 API，这条
 
 **🧹 一次删干净**：会话日志目录、投影缓存行、归档与置顶标记、工作区 `sessionIds` 槽位、内存里的活动会话，一个都不留；删完浏览器**原地移除该行，不用刷新页面**。
 
-**🛡️ 删得安全**：运行中的会话直接返回 `409` 拒绝，绝不删一个正在写入的日志；删不掉最多重试 11 轮，再报 `500` + 剩余目录，不假装成功；id 过白名单正则，杜绝路径穿越；`dryRun` 可以先只看不动。
+**🛡️ 删得安全**：运行中的会话直接返回 `409` 拒绝，绝不删一个正在写入的日志；删不掉最多重试 11 轮，再报 `500` + 剩余目录，**且失败时不动归档/置顶/缓存/工作区任何标记**——修好文件占用后可以原样重试，不假装成功；id 只接受单段安全字符集（字母数字与 `-_.`，拒路径分隔符、`.hidden`、结尾的点），第三方插件造的 `social-<hex>` 这类 id 也能删，同时杜绝路径穿越；`dryRun` 可以先只看不动。
 
 ---
 
@@ -88,9 +88,9 @@ curl -X POST 'http://<你的 DSH Web 地址>/api/dsh-session-delete' \
   -d '{"sessionId":"session-6f1c2f0e-3b7a-4a6e-9a1d-2c5b8f7d9e01","dryRun":true}'
 ```
 
-`sessionId` 必填，三种 id 形态都行；`dryRun` 可选；成功回 `ok: true` 以及删掉的目录、清理的缓存行数、`warnings`；出错看返回的 `code`：`invalid-id`、`not-found`、`running`、`cannot-detach`、`delete-failed` 等。该路由走 DSH 共享的 `/api` 通道，自带 Host/Origin 信任检查与 Cookie 鉴权。
+`sessionId` 必填，宿主 id（`session-<uuid>` 或裸 uuid）和第三方插件自造的 id（例如 `social-<hex>`）都可以，只要是不含路径分隔符的单段安全字符；`dryRun` 可选；成功回 `ok: true` 以及实际使用的 `root`、删掉的目录、清理的缓存行数、`warnings`；出错看返回的 `code`：`invalid-id`、`not-found`、`running`、`cannot-detach`、`logs-not-found`（持久层有记录但配置的根目录下找不到日志）、`delete-failed` 等。`500 delete-failed` 表示**文件没删净且未做任何清理**，响应里带 `remainingDirs`、`removedDirs` 和 `root`。该路由走 DSH 共享的 `/api` 通道，自带 Host/Origin 信任检查与 Cookie 鉴权。
 
-**环境变量**：只有 `DSH_HOME` 一个，默认 `~/.dsh`；删除范围完全由它决定。
+**环境变量**：`DSH_HOME`（默认 `~/.dsh`）只作兜底；会话根目录优先取运行时持久层配置的 `root`，两者不一致时以持久层为准。
 
 **⚠️ 记住三条**：删除不可恢复；运行中的会话拒绝删除；客户端更新后要刷新页面 / 重启应用。
 

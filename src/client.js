@@ -4,7 +4,7 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
     const NS = 'dsh-minimal-session-delete'
-    const ROUTE = 'api/dsh-session-delete'
+    const ROUTE = '/api/dsh-session-delete'
     const SHORTCUT_ID = 'session.delete'
     const ACTION_ID = 'dsh-session-delete'
     const DIALOG_ID = 'dsh-session-delete-confirm'
@@ -351,8 +351,26 @@ window.__ModuleLoader__.load({
           displayTitle: typeof displayTitle === 'string' ? displayTitle : '',
         })
         const closeConfirm = () => { deleteRequest.set(null) }
+        const retainedInMainView = (sessionId) => {
+          try {
+            const row = ctx.sessions?.list?.getSnapshot?.()?.byId?.[sessionId]
+            return (row?.retainedBy?.mainView ?? 0) > 0
+          } catch {
+            return false
+          }
+        }
+        const clearMainView = () => {
+          const workspaceUi = typeof ctx.get === 'function' ? ctx.get('uiWorkspace') : undefined
+          if (typeof workspaceUi?.clearMain !== 'function') return
+          try {
+            workspaceUi.clearMain()
+          } catch (reason) {
+            console.warn('dsh-session-delete: could not clear the deleted session view:', reason)
+          }
+        }
         const performDelete = async (sessionId) => {
           const failure = (detail) => new Error(`${t('errors.requestFailed')}${detail}`)
+          const wasOpen = retainedInMainView(sessionId)
           let response
           try {
             response = await fetch(ROUTE, {
@@ -364,7 +382,12 @@ window.__ModuleLoader__.load({
             throw failure(`: ${reason instanceof Error ? reason.message : String(reason)}`)
           }
           const payload = await response.json().catch(() => null)
-          if (response.ok && payload?.ok === true) return payload
+          if (response.ok && payload?.ok === true) {
+            // The deleted session may be the one the main view is showing; leaving it
+            // mounted leaves a "history load failed" panel behind.
+            if (wasOpen) clearMainView()
+            return payload
+          }
           const detail = typeof payload?.message === 'string' ? `: ${payload.message}` : ''
           throw failure(` (HTTP ${String(response.status)})${detail}`)
         }
