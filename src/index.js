@@ -1,4 +1,4 @@
-import { deleteSessionCore } from './core.js'
+import { deleteSessionCore, hostCapabilities } from './core.js'
 export const name = 'dsh-session-delete'
 export const inject = ['sessions', 'agents', 'connection']
 export const DELETE_ROUTE = '/api/dsh-session-delete'
@@ -23,11 +23,23 @@ async function readPayload(request) {
 export function apply(ctx) {
   const dispose = ctx.connection.fetch.register({
     path: DELETE_ROUTE,
-    methods: ['POST'],
+    methods: ['GET', 'POST'],
     requestBody: 'buffered',
     fetch: async (request) => {
+      if (request.method === 'GET') {
+        // Machine-readable host-contract probe. The client and any external
+        // caller can decide whether live deletion and cascade are available
+        // instead of discovering a missing internal halfway through a delete.
+        let capabilities
+        try {
+          capabilities = hostCapabilities(ctx)
+        } catch (error) {
+          capabilities = { mode: 'unknown', error: messageOf(error) }
+        }
+        return json(200, { ok: true, capabilities })
+      }
       if (request.method !== 'POST') {
-        return json(405, { ok: false, code: 'method-not-allowed', message: 'use POST' })
+        return json(405, { ok: false, code: 'method-not-allowed', message: 'use GET or POST' })
       }
       const { payload, refusal } = await readPayload(request)
       if (refusal !== undefined) return refusal

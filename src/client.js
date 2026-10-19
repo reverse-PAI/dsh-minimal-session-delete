@@ -31,6 +31,12 @@ window.__ModuleLoader__.load({
       'common.close': '关闭',
       'errors.requestFailed': '删除请求失败',
       'errors.forbidden': '当前连接没有删除会话的权限',
+      'errors.running': '该会话正在运行，请先停止再删除',
+      'errors.stillRunning': '会话仍在停止中，请等本回合结束后重试',
+      'errors.cannotDetach': '当前 Harness 版本缺少安全删除已附着会话所需的接口',
+      'errors.unsupported': '当前 Harness 版本不支持这种删除方式',
+      'errors.ambiguous': '同时存在多个相似 id 的会话目录，请用精确 id 重试',
+      'errors.logsNotFound': '持久层记录了该会话，但找不到对应日志目录',
     }
     const EN = {
       'menu.deleteSession': 'Delete session',
@@ -47,6 +53,12 @@ window.__ModuleLoader__.load({
       'common.close': 'Close',
       'errors.requestFailed': 'Delete request failed',
       'errors.forbidden': 'This connection is not allowed to delete sessions',
+      'errors.running': 'This session is running. Stop it before deleting.',
+      'errors.stillRunning': 'The session is still stopping. Wait for the turn to finish and retry.',
+      'errors.cannotDetach': 'This Harness build lacks the detach API needed to delete an attached session',
+      'errors.unsupported': 'This Harness build does not support this deletion path',
+      'errors.ambiguous': 'Several session directories match similar ids. Retry with the exact id.',
+      'errors.logsNotFound': 'Persistence reports this session but its log directory is missing',
     }
     const MENU_CSS = `
 .dsd-itemWrap{position:relative}
@@ -400,6 +412,17 @@ window.__ModuleLoader__.load({
             return payload
           }
           if (response.status === 403) throw failure(`: ${t('errors.forbidden')}`)
+          const known = {
+            'running': 'errors.running',
+            'still-running': 'errors.stillRunning',
+            'cannot-detach': 'errors.cannotDetach',
+            'unsupported': 'errors.unsupported',
+            'ambiguous-id': 'errors.ambiguous',
+            'logs-not-found': 'errors.logsNotFound',
+          }
+          if (typeof payload?.code === 'string' && known[payload.code] !== undefined) {
+            throw failure(`: ${t(known[payload.code])}`)
+          }
           const detail = typeof payload?.message === 'string' ? `: ${payload.message}` : ''
           throw failure(` (HTTP ${String(response.status)})${detail}`)
         }

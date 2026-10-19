@@ -17,7 +17,9 @@ function harness(overrides = {}) {
     logger: { warn() {}, error() {} },
     sessions: { get: () => undefined, flush: async () => {} },
     agents: { get: () => undefined },
-    get: () => undefined,
+    get(key) {
+      return key === 'sessions' ? this.sessions : key === 'agents' ? this.agents : undefined
+    },
     emit: (event, ...args) => { emitted.push([event, ...args]) },
     ...overrides,
   }
@@ -25,17 +27,49 @@ function harness(overrides = {}) {
   return { route, emitted }
 }
 
-test('registers the delete route as an authenticated buffered POST', () => {
+test('registers the delete route as an authenticated buffered GET/POST', () => {
   const { route } = harness()
   assert.equal(route.path, DELETE_ROUTE)
-  assert.deepEqual(route.methods, ['POST'])
+  assert.deepEqual(route.methods, ['GET', 'POST'])
   assert.equal(route.requestBody, 'buffered')
   assert.equal(typeof route.fetch, 'function')
 })
 
+test('GET reports the host capabilities instead of attempting a delete', async () => {
+  const { route, emitted } = harness()
+  const response = await route.fetch(new Request(`http://x${DELETE_ROUTE}`, { method: 'GET' }))
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.equal(body.ok, true)
+  assert.equal(body.capabilities.mode, 'filesystem-only')
+  assert.equal(body.capabilities.detachLive, false)
+  assert.deepEqual(emitted, [])
+})
+
+test('a host delete API is delegated to and never touches the filesystem', async () => {
+  const calls = []
+  const { route, emitted } = harness({
+    sessions: {
+      get: () => undefined,
+      flush: async () => {},
+      delete: async (id) => { calls.push(id); return { deleted: true } },
+    },
+  })
+  const response = await route.fetch(new Request(`http://x${DELETE_ROUTE}`, {
+    method: 'POST',
+    body: JSON.stringify({ sessionId: 'social-0123456789abcdef0123456789abcdef' }),
+  }))
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.equal(body.mode, 'native')
+  assert.deepEqual(calls, ['social-0123456789abcdef0123456789abcdef'])
+  // The host owns its own removal event; the plugin must not double-broadcast.
+  assert.deepEqual(emitted, [])
+})
+
 test('the route rejects non-POST, non-object JSON and invalid ids', async () => {
   const { route } = harness()
-  const get = await route.fetch(new Request(`http://x${DELETE_ROUTE}`, { method: 'GET' }))
+  const get = await route.fetch(new Request(`http://x${DELETE_ROUTE}`, { method: 'PUT' }))
   assert.equal(get.status, 405)
   assert.equal((await get.json()).code, 'method-not-allowed')
 

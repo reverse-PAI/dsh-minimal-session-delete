@@ -120,6 +120,75 @@ function cacheRowExists(cache, variant) {
   }
   return fs.existsSync(cacheRecordPath(variant))
 }
+function nativeDelete(ctx) {
+  const sessions = service(ctx, 'sessions')
+  if (typeof sessions?.delete === 'function') return sessions.delete.bind(sessions)
+  const persistence = service(ctx, 'sessionPersistence')
+  if (typeof persistence?.delete === 'function') return persistence.delete.bind(persistence)
+  return undefined
+}
+function realRootOf(root) {
+  try {
+    return fs.realpathSync(root)
+  } catch {
+    return path.resolve(root)
+  }
+}
+/**
+ * Keep only directories that really live under the configured session root.
+ * `realpath` resolves symlinks, so a link pointing outside the root is dropped
+ * before any rename or rm can follow it.
+ */
+function containedDirs(dirs, root, warnings) {
+  const realRoot = realRootOf(root)
+  const kept = []
+  for (const dir of dirs) {
+    let real
+    try {
+      real = fs.realpathSync(dir)
+    } catch (error) {
+      note(warnings, `realpath("${dir}")`, error)
+      continue
+    }
+    if (real === realRoot || real.startsWith(realRoot + path.sep)) kept.push(dir)
+    else warnings.push(`ignored session directory outside ${root}: "${dir}" -> "${real}"`)
+  }
+  return kept
+}
+/**
+ * Describe which host contracts this build actually exposes. Deleting a cold
+ * session needs only the filesystem; deleting a live one additionally needs the
+ * session store's detach path; cascading and accounting are best-effort extras.
+ * The plugin reports this through `GET <route>` so callers can degrade explicitly
+ * instead of discovering missing internals halfway through a delete.
+ */
+export function hostCapabilities(ctx) {
+  const sessions = service(ctx, 'sessions')
+  const persistence = service(ctx, 'sessionPersistence')
+  const agents = service(ctx, 'agents')
+  const storageDomain = service(ctx, 'storageDomain')
+  const registry = service(ctx, 'workspaceRegistry')
+  const native = nativeDelete(ctx)
+  const capabilities = {
+    mode: native !== undefined ? 'native' : undefined,
+    native: typeof sessions?.delete === 'function'
+      ? 'sessions.delete'
+      : typeof persistence?.delete === 'function' ? 'sessionPersistence.delete' : null,
+    detachLive: typeof sessions?.detachEntered === 'function' && typeof sessions?.store?.get === 'function',
+    flush: typeof sessions?.flush === 'function',
+    persistenceRoot: typeof persistence?.root === 'string',
+    persistenceStat: typeof persistence?.stat === 'function',
+    persistenceList: typeof persistence?.list === 'function',
+    agentsDetach: typeof agents?.detachEntered === 'function' && typeof agents?.store?.get === 'function',
+    projectionCache: typeof storageDomain?.get === 'function',
+    workspaceRegistry: typeof registry?.list === 'function',
+  }
+  if (capabilities.mode === undefined) capabilities.mode = capabilities.detachLive ? 'detach' : 'filesystem-only'
+  return capabilities
+}
+function ambiguousNames(dirs) {
+  return [...new Set(dirs.map(dir => path.basename(dir)))]
+}
 async function locate(ctx, variants, root, warnings) {
   const live = variants
     .map(variant => ({ variant, session: ctx.sessions.get(variant) }))
@@ -144,7 +213,7 @@ async function locate(ctx, variants, root, warnings) {
   const cached = variants.filter(variant => cacheRowExists(cache, variant))
   const dirs = []
   for (const variant of new Set(variants)) dirs.push(...findSessionDirs(variant, root))
-  const uniqueDirs = [...new Set(dirs)]
+  const uniqueDirs = containedDirs([...new Set(dirs)], root, warnings)
   // Report the id the host/UI actually uses, not just the spelling the caller typed
   // (the API accepts both `session-<uuid>` and the bare uuid).
   let canonical = variants[0]
@@ -152,7 +221,8 @@ async function locate(ctx, variants, root, warnings) {
   else if (uniqueDirs.length > 0) canonical = path.basename(uniqueDirs[0])
   else if (persistedVariant !== undefined) canonical = persistedVariant
   else if (cached.length > 0) canonical = cached[0]
-  return { live, persisted, cachedRows: cached.length, cache, dirs: uniqueDirs, canonical }
+  const names = ambiguousNames(uniqueDirs)
+  return { live, persisted, cachedRows: cached.length, cache, dirs: uniqueDirs, canonical, names }
 }
 function agentPhase(agent) {
   const kind = agent?.phase?.kind
@@ -530,11 +600,59 @@ export async function deleteSessionCore(ctx, rawSessionId, options = {}) {
     return fail(400, 'invalid-id', `invalid session id: ${JSON.stringify(rawSessionId)}`)
   }
   const warnings = []
+  const capabilities = hostCapabilities(ctx)
+  // A host that grows a first-class delete API owns the whole lifecycle
+  // (detach, accounting, removal event). Delegate and never touch the files
+  // ourselves, so the plugin cannot drift from the host's semantics.
+  const nativeApi = nativeDelete(ctx)
+  if (nativeApi !== undefined && options.dryRun === true) {
+    // The native API has no inspect-only mode; do not fall through to the
+    // filesystem locate, which may not know where this host keeps its sessions.
+    return pass({
+      dryRun: true,
+      mode: 'native',
+      native: capabilities.native,
+      sessionId,
+      note: 'native host delete API; dryRun does not call it',
+    })
+  }
+  const native = options.dryRun === true ? undefined : nativeApi
+  if (native !== undefined) {
+    try {
+      const variants = sessionIdVariants(sessionId)
+      let result = false
+      for (const variant of variants) {
+        result = await native(variant)
+        if (result !== false) break
+      }
+      if (result === false) return fail(404, 'not-found', `no session found for "${sessionId}"`)
+      return pass({
+        native: capabilities.native,
+        mode: 'native',
+        sessionId,
+        removedSessions: variants,
+        broadcast: [],
+        warnings,
+        result: result ?? null,
+      })
+    } catch (error) {
+      return fail(500, 'delete-failed', `the host delete API failed: ${messageOf(error)}`, { sessionId })
+    }
+  }
   const root = sessionsRoot(ctx)
   const primaryVariants = sessionIdVariants(sessionId)
   const primary = await locate(ctx, primaryVariants, root, warnings)
   if (primary.dirs.length === 0 && primary.live.length === 0 && !primary.persisted && primary.cachedRows === 0) {
     return fail(404, 'not-found', `no session found for "${sessionId}"`)
+  }
+  if (primary.names.length > 1) {
+    // `abc` and `session-abc` are two different real directories: deleting both
+    // would destroy a session the caller never named. Refuse and let the caller
+    // retry with the exact id.
+    return fail(409, 'ambiguous-id', `both "${primary.names.join('" and "')}" exist; delete one exact id at a time`, {
+      sessionId,
+      candidates: primary.names,
+    })
   }
   const descendants = await discoverSubagentDescendants(ctx, sessionId, warnings)
   const described = [{ sessionId, variants: primaryVariants, ...primary }]
@@ -542,11 +660,18 @@ export async function deleteSessionCore(ctx, rawSessionId, options = {}) {
     const variants = sessionIdVariants(childId)
     const located = await locate(ctx, variants, root, warnings)
     if (located.dirs.length === 0 && located.live.length === 0 && !located.persisted && located.cachedRows === 0) continue
+    if (located.names.length > 1) {
+      return fail(409, 'ambiguous-id', `subagent session id is ambiguous: "${located.names.join('" and "')}"`, {
+        sessionId: childId,
+        candidates: located.names,
+      })
+    }
     described.push({ sessionId: childId, variants, ...located })
   }
   if (options.dryRun === true) {
     return pass({
       dryRun: true,
+      mode: capabilities.mode,
       sessionId,
       root,
       dirs: relativeDirs(primary.dirs, root),
@@ -632,6 +757,7 @@ export async function deleteSessionCore(ctx, rawSessionId, options = {}) {
   const removedSessions = viable.map(entry => entry.canonical ?? entry.sessionId)
   const broadcast = removedSessions.filter(id => !sessionIdVariants(id).some(variant => detach.detached.has(variant)))
   return pass({
+    mode: capabilities.mode,
     sessionId,
     root,
     removedDirs: relativeDirs(removedDirs, root),
